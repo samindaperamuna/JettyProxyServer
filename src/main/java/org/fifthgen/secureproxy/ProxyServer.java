@@ -1,12 +1,9 @@
-package org.fifthgen.proxytest;
+package org.fifthgen.secureproxy;
 
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory;
 import org.eclipse.jetty.proxy.ConnectHandler;
 import org.eclipse.jetty.server.*;
-import org.eclipse.jetty.server.handler.ContextHandlerCollection;
-import org.eclipse.jetty.server.handler.DefaultHandler;
 import org.eclipse.jetty.server.handler.HandlerCollection;
-import org.eclipse.jetty.server.handler.RequestLogHandler;
 import org.eclipse.jetty.server.handler.gzip.GzipHandler;
 import org.eclipse.jetty.servlet.DefaultServlet;
 import org.eclipse.jetty.servlet.ServletContextHandler;
@@ -24,9 +21,9 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
-import static org.eclipse.jetty.servlet.ServletContextHandler.SESSIONS;
+import static org.eclipse.jetty.servlet.ServletContextHandler.NO_SESSIONS;
 
-public class ProxyServerWithTLS {
+public class ProxyServer {
 
     private final int httpPort;
     private final int httpsPort;
@@ -44,16 +41,14 @@ public class ProxyServerWithTLS {
     private static final String[] WELCOME_FILES = new String[]{WELCOME_FILE};
 
     private final Set<String> whiteListedHosts = new HashSet<>(Arrays.asList(
-            "localhost",
-            "google.com",
-            "detectportal.firefox.com",
-            "twitter.com",
-            "skvazy.com",
-            "snowmoscow.ru"
+            "detectportal.firefox.com:80",
+            "twitter.com:443",
+            "skvazy.com:443",
+            "snowmoscow.ru:443"
     ));
-    private static final Logger LOG = LoggerFactory.getLogger(ProxyServerWithTLS.class);
+    private static final Logger LOG = LoggerFactory.getLogger(ProxyServer.class);
 
-    ProxyServerWithTLS(int httpPort, int httpsPort) {
+    ProxyServer(int httpPort, int httpsPort) {
         this.httpPort = httpPort;
         this.httpsPort = httpsPort;
     }
@@ -86,61 +81,38 @@ public class ProxyServerWithTLS {
             // Non-secure request port
             connector.setPort(httpPort);
 
-            // SSL request port
+            // Secure request port
             sslConnector.setPort(httpsPort);
 
             server.addConnector(connector);
-            // server.addConnector(sslConnector);
+            server.addConnector(sslConnector);
 
             // Configure server handlers
             HandlerCollection allHandlers = new HandlerCollection();
-            ContextHandlerCollection contextHandlers = new ContextHandlerCollection();
-            allHandlers.setHandlers(new Handler[]{contextHandlers, new DefaultHandler()});
             server.setHandler(allHandlers);
+
+            // Handlers CONNECT requests, essential for HTTP proxying
+            ConnectHandler connectHandler = new ConnectHandler();
+            connectHandler.getWhiteListHosts().addAll(whiteListedHosts);
+            allHandlers.addHandler(connectHandler);
 
             // GZIP handler
             GzipHandler gzipHandler = new GzipHandler();
-            gzipHandler.setHandler(contextHandlers);
             allHandlers.addHandler(gzipHandler);
 
-            // Handler for main context
-            ServletContextHandler mainContext = new ServletContextHandler(contextHandlers, "/about", SESSIONS);
-            mainContext.setWelcomeFiles(WELCOME_FILES);
-            mainContext.setBaseResource(Resource.newResource(resolveContextPath(STATIC_FILE_PATH + "/" + WELCOME_FILE)));
-            mainContext.addServlet(DefaultServlet.class, "/about");
+            // Handler for about context
+            ServletContextHandler aboutContext = new ServletContextHandler(allHandlers, "/about/", NO_SESSIONS);
+            aboutContext.setWelcomeFiles(WELCOME_FILES);
+            aboutContext.setBaseResource(Resource.newResource(resolveContextPath(STATIC_FILE_PATH + "/" + WELCOME_FILE)));
+            aboutContext.addServlet(DefaultServlet.class, "/about");
 
-            // Handler for proxy context
-            ServletContextHandler proxyContext = new ServletContextHandler(contextHandlers, "/", SESSIONS);
+            // Handler for root context, must be a proxy handler servlet
+            ServletContextHandler rootContext = new ServletContextHandler(allHandlers, "/", NO_SESSIONS);
 
-            ProxyServletWithTLSParams proxyServlet = new ProxyServletWithTLSParams();
-            //proxyServlet.getWhiteListHosts().addAll(whiteListedHosts);
-
-            // Truststore information for client used in the servlet
-            // proxyServlet.setTrustStorePath(resolveContextPath(CA_CERTS_PATH + "/" + TRUST_STORE) + TRUST_STORE);
-            // proxyServlet.setTrustStorePassword(TRUST_STORE_PASS);
+            SecureProxyServlet proxyServlet = new SecureProxyServlet(whiteListedHosts);
 
             ServletHolder proxyServletHolder = new ServletHolder(proxyServlet);
-            proxyContext.addServlet(proxyServletHolder, "/*");
-
-            //TODO: for testing only
-//            MyProxyServlet.Transparent tpProxy = new MyProxyServlet.Transparent();
-//            ServletHolder holderPortalProxy = new ServletHolder("portalProxy", tpProxy);
-//            holderPortalProxy.setName("portalProxy");
-//            holderPortalProxy.setInitParameter("proxyTo", "https://www.google.com");
-//            holderPortalProxy.setInitParameter("prefix", "/");
-//            holderPortalProxy.setAsyncSupported(true);
-//            proxyContext.addServlet(holderPortalProxy, "/*");
-
-            // Log handler for all contexts
-            RequestLogHandler requestLogHandler = new RequestLogHandler();
-            var customRequestLog = new CustomRequestLog(new Slf4jRequestLogWriter(), CustomRequestLog.EXTENDED_NCSA_FORMAT);
-            requestLogHandler.setRequestLog(customRequestLog);
-            contextHandlers.addHandler(requestLogHandler);
-
-            // Handlers CONNECT requests
-            ConnectHandler connectHandler = new ConnectHandler();
-            // connectHandler.getWhiteListHosts().addAll(whiteListedHosts);
-            contextHandlers.addHandler(connectHandler);
+            rootContext.addServlet(proxyServletHolder, "/");
 
             server.start();
             server.join();
@@ -165,7 +137,7 @@ public class ProxyServerWithTLS {
         // Http/2 connection factory
         HTTP2CServerConnectionFactory h2c = new HTTP2CServerConnectionFactory(httpConfig);
 
-        return new ServerConnector(server, http11);
+        return new ServerConnector(server, http11, h2c);
     }
 
     /**
@@ -217,7 +189,7 @@ public class ProxyServerWithTLS {
         // Connection factory for TLS
         SslConnectionFactory tls = new SslConnectionFactory(sslContextFactory, http11.getProtocol());
 
-        return new ServerConnector(server, tls, http11);
+        return new ServerConnector(server, tls, http11, h2c);
     }
 
     /**
@@ -228,7 +200,7 @@ public class ProxyServerWithTLS {
      * @return Resolved context path as a {@link URI}
      */
     private URI resolveContextPath(String path) throws URISyntaxException, RuntimeException {
-        ClassLoader loader = ProxyServerWithTLS.class.getClassLoader();
+        ClassLoader loader = ProxyServer.class.getClassLoader();
         URL url = loader.getResource(path);
 
         if (url == null) {
